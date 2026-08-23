@@ -1,0 +1,48 @@
+====================================================================
+ PVE 8 -> 9 CLUSTER UPGRADE  —  final package  (REV 3)
+ Built: 2026-08-23 (rev 3.1)   |   Target: PVE 9.2 (Debian 13.5, kernel 7.0)
+ Cluster: pve1 / pve2 / pve3  (Dell Wyse 5060, 8.4.20)
+ THIS ZIP IS THE ONLY CURRENT COPY. Delete every earlier zip.
+====================================================================
+
+FILES
+  PVE8-to-9-UPGRADE-RUNBOOK.md   <- START HERE. Read top to bottom.
+  pve9-preflight.sh              Step A each node (checks + backup + sweep audits)
+  pve9-repo-swap.sh              Step D each node (repos->trixie, nag hook parked)
+  pve9-postcheck.sh              Step F each node (verify + explicit apt-update gate)
+
+PER-NODE ORDER (one node fully, then the next — never two at once)
+  Node 1 (empty, canary) -> Node 2 (Docker) -> Node 3 (Nextcloud)
+    A  preflight            (GO/NO-GO + REV-3 sweep audits)
+    B  pin NIC names        pve-network-interface-pinning generate  (reboot on 8, verify)
+    C  guests off           migrate or stop (skip empty Node 1)
+    D  repo swap            YES; confirm apt update clean
+    E  apt dist-upgrade     interactive (answers in runbook)
+    F  reboot + postcheck   green light before next node
+    G  restore tweaks       nag fix (+ Docker fresh-key re-enable on Node 2)
+
+REV-3 CHANGES (merged from the Aug 22 sweep; verified vs official docs)
+  * rev 3.1 fix: preflight no longer false-FAILs on dormant Ceph client libs, and
+    the FAIL tally ignores the "FAILURES: 0" summary line (both learned on Node 1).
+  * Target confirmed PVE 9.2 = Debian 13.5, kernel 7.0, QEMU 11, LXC 7, ZFS 2.4.
+  * NIC pinning BEFORE upgrade (tool is in pve-manager >= 8.4.9; you're 8.4.20).
+  * SHA-1/sqv third-party key rejection (Trixie, since 2026-02-01):
+    scoped to NODE 2 DOCKER ONLY, handled at re-enable with a fresh key.
+    Debian + Proxmox keyrings already modern on all 3 nodes = core upgrade safe.
+  * Preflight now audits: 3rd-party repos/keyrings, boot method (efibootmgr),
+    /etc/sysctl.conf tunables, custom VM.Monitor ACL roles, NIC-pin readiness.
+  * Postcheck now runs an explicit apt update to catch a SHA-1 rejection on
+    THIS node instead of a surprise on the next.
+  * systemd-boot / ZFS-boot items: likely N/A on legacy-BIOS Wyse boxes; if
+    pve8to9 raises them, DO NOT blind-purge — confirm efibootmgr first.
+
+HARD GATES
+  * Ceph absent (confirmed). Pre-flight stops if it isn't.
+  * pve8to9 --full must show 0 FAIL before repo swap.
+  * apt update after swap must be error-free before dist-upgrade.
+  * NO downgrade from 9 -> 8. Node 1 first = safe canary.
+
+Deadline: 2026-08-31 (PVE 8 EOL). ~1-1.5 hr/node incl. validation.
+Sources: Proxmox 8->9 wiki; 9.2 release notes; Debian Trixie sqv SHA-1 policy;
+pve-network-interface-pinning backport (pve-manager >= 8.4.9). Verified 2026-08-22.
+====================================================================
