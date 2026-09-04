@@ -1,12 +1,19 @@
-# Rolling Proxmox VE 8 → 9 Cluster Upgrade (Zero Cluster Downtime, Headless)
+# Proxmox VE 8 → 9 Cluster Upgrade — Validated Procedures
 
-Upgrading a live 3-node Proxmox VE cluster from **8.4 → 9.2** — across a major
+This repository documents the test procedures and results from upgrading a live
+3-node Proxmox VE cluster from **8.4 → 9.2** — across a major
 Debian release (12 *Bookworm* → 13 *Trixie*) and a new kernel (**7.0**) — one node
 at a time, with the cluster staying quorate throughout and each node accessed
 **only over SSH** (no physical console, no IPMI).
 
-**Outcome:** all three nodes upgraded, verified, and cleaned up. Cluster never lost
-quorum. No data loss. No node required a physical rescue despite being headless.
+**Outcome:** all three nodes upgraded, verified, and cleaned up. The cluster control
+plane never lost quorum; guest downtime was handled per workload because storage was
+local. No data was lost, and no node required physical rescue.
+
+> **Validation note:** The operational sequence was executed successfully in August
+> 2026. The scripts were subsequently strengthened after a retrospective safety
+> review. Those revisions pass static and syntax checks, but should be exercised on a
+> canary before reuse on another cluster.
 
 ---
 
@@ -34,20 +41,20 @@ This wasn't a single-host reinstall. The constraints are what made it interestin
 | | |
 |---|---|
 | Cluster | 3 nodes (`pve1`/`pve2`/`pve3`), quorum-based |
-| Hardware | Dell Wyse 5060 · AMD GX-424CC · 16 GB RAM · 1 TB · legacy-BIOS→**UEFI/GRUB** boot |
+| Hardware | Dell Wyse 5060 · AMD GX-424CC · 16 GB RAM · 1 TB · **UEFI/GRUB** boot |
 | Storage | Local only (LVM-thin) — **no shared storage, no Ceph cluster** |
 | From | PVE 8.4.x / Debian 12 / kernel 6.8 |
 | To | **PVE 9.2 / Debian 13.5 / kernel 7.0** (QEMU 11, LXC 7, ZFS 2.4) |
 | Access | SSH only, headless |
 | Workloads | A NextcloudPi VM; a handful of dormant Docker containers |
 
-## Method
+## Test procedures and controls
 
 A few principles drove the design, encoded into the scripts and runbook:
 
 1. **Canary first.** The emptiest node was upgraded first. Because all three boxes are
    identical hardware, a clean boot on the new kernel there de-risked the other two —
-   it answered the biggest unknown (does an 11-year-old AMD SoC boot kernel 7.0?) at
+   it answered the biggest unknown (does decade-old AMD hardware boot kernel 7.0?) at
    zero cost.
 2. **One node at a time, quorum preserved.** Never two nodes down simultaneously.
 3. **Verify before committing, especially on the network.** NIC name pinning was
@@ -55,9 +62,9 @@ A few principles drove the design, encoded into the scripts and runbook:
    *live* (`ifreload -a`) to prove it worked while still reachable — and only then
    carried through a reboot. The riskiest headless step was made observable before the
    irreversible one.
-4. **Gate the one-way step.** Backups + the official `pve8to9 --full` checker had to
-   pass clean before the repository swap; the swap's `apt update` had to be error-free
-   before `apt dist-upgrade`.
+4. **Gate the one-way step.** Configuration and guest backups, a tested restore, and
+   the official `pve8to9 --full` checker must pass before the repository swap. The
+   swap exits nonzero unless `apt update` is clean.
 5. **Automate the mechanical, keep judgment human.** Scripts handle checks, backups,
    and repo rewrites. The interactive `dist-upgrade` (with its config-file prompts) is
    driven by hand, inside `tmux` so a dropped SSH session can't kill it mid-flight.
@@ -65,15 +72,15 @@ A few principles drove the design, encoded into the scripts and runbook:
 ## Per-node sequence
 
 ```
-pre-flight (checks + backup)  →  GO
+pre-flight (checks + external backup + tested-restore confirmation)  →  GO
   → GRUB-EFI fix              (bootloader gap, see below)
   → pin NIC name             (generate → verify → ifreload → reboot-verify on 8)
   → guests off               (stop/insulate workloads)
-  → repo swap                (bookworm → trixie, deb822, keys, nag hook parked)
+  → repo swap                (allowlisted sources → trixie, deb822, local hook parked)
   → apt dist-upgrade         (interactive, inside tmux)
   → reboot into kernel 7.0
-  → post-check               (version / quorum / services / NIC / apt clean)
-  → restore tweaks           (nag fix; Docker re-enable where applicable)
+  → post-check               (hard gate: version / quorum / services / NIC / apt)
+  → restore services         (Docker repository re-created where applicable)
 ```
 
 Run order: **canary → Docker node → app (Nextcloud) node.**
@@ -98,8 +105,8 @@ The parts that don't show up in a tidy tutorial — the actual friction, and the
   `sqv` and rejects SHA-1-bound keys (effective 2026-02-01). Scoped it precisely: the
   Debian and Proxmox keyrings were already modern, so the core upgrade was unaffected —
   the only exposure was a third-party Docker repo whose legacy key would be rejected.
-  Handled by disabling that repo during the upgrade and re-adding it on the far side
-  with a fresh, SHA-256 key pinned via `signed-by=`.
+  Handled by disabling that repo during the upgrade and recreating it afterward using
+  Docker's current deb822 repository and vendor keyring instructions.
 
 - **Dormant Ceph client libraries triggering a false alarm.** A blunt "is Ceph present?"
   check failed because leftover Ceph *client* libraries were installed — but there was
@@ -117,9 +124,10 @@ The parts that don't show up in a tidy tutorial — the actual friction, and the
   catch — causing a `401 Unauthorized` on `apt update` post-upgrade. Disabled it with
   `Enabled: false` on each node.
 
-- **Subscription-nag re-patch across the upgrade.** A community post-install nag-removal
-  patch (and its APT hook) was present. The hook was parked before the upgrade so it
-  couldn't fire mid-`dist-upgrade`, and the patch re-applied cleanly on 9 afterward.
+- **Unsupported local APT hook.** A community customization had installed an APT hook.
+  It was parked before the distribution upgrade so non-vendor code could not run in the
+  middle of package configuration. Re-enabling such customizations is deliberately
+  outside the validated upgrade procedure.
 
 ## Verification
 
@@ -138,10 +146,11 @@ Each node was confirmed via the bundled post-check and the official checker:
 Finished means finished — the cluster was left tidy, not just working:
 
 - Installed `amd64-microcode` on all nodes (clears the last checker advisory).
-- Disabled the unauthenticated enterprise repo on all nodes.
+- Disabled enterprise repository entries that were not backed by a subscription.
 - Removed ~2 GB of years-old unused Docker containers/images cluster-wide; left Docker
   Engine installed but stopped and disabled at boot.
-- Re-applied the UI nag fix on each node.
+- Operationally, the UI customization was later re-applied; REV 4 deliberately leaves
+  that unsupported action outside the validated procedure.
 - Deliberately **left** the old fallback kernels in place (prune after a stability
   window) and ignored cosmetic advisories (LVM autoactivation notice on local storage,
   legacy-format RRD files) that the checker itself rates as harmless.
@@ -150,10 +159,10 @@ Finished means finished — the cluster was left tidy, not just working:
 
 | File | Purpose |
 |---|---|
-| `PVE8-to-9-UPGRADE-RUNBOOK.md` | The full step-by-step runbook, with per-node sequence, config-prompt answers, rollback guidance, and hardware-specific gotchas. |
-| `pve9-preflight.sh` | Non-destructive pre-flight: version/space/quorum checks, config + guest backup, runs `pve8to9 --full`, plus audits (keyrings, boot method, NIC-pin readiness). GO/NO-GO verdict. |
-| `pve9-repo-swap.sh` | Rewrites repos bookworm→trixie (deb822, correct signing key), disables third-party/enterprise repos for the upgrade, parks the nag hook. Interactive confirmation + `apt update` verification. |
-| `pve9-postcheck.sh` | Post-reboot verification: version, kernel, quorum, failed units, NIC names, explicit `apt update` (catches signature rejections). |
+| [PVE8-to-9-UPGRADE-RUNBOOK.md](PVE8-to-9-UPGRADE-RUNBOOK.md) | The full step-by-step procedure, with per-node sequencing, configuration-prompt guidance, rollback boundaries, and hardware-specific issues. |
+| [pve9-preflight.sh](pve9-preflight.sh) | Hard-gated preflight: version, space, quorum, external guest backups, restore-test confirmation, official checker, repositories, boot method, and NIC readiness. |
+| [pve9-repo-swap.sh](pve9-repo-swap.sh) | Allowlisted Debian/Proxmox migration to Trixie/deb822. Unknown vendors and a failed `apt update` stop the procedure. |
+| [pve9-postcheck.sh](pve9-postcheck.sh) | Post-reboot hard gate for PVE version, quorum, services, failed units, repositories, networking, and `apt update`. |
 
 ## Skills demonstrated
 
@@ -165,5 +174,5 @@ problems.
 
 ---
 
-*Homelab project. All addresses shown are RFC-1918 private. No credentials or secrets
-are included in this repository.*
+*Homelab project. Host identifiers are generic, and no credentials, public addresses,
+or secrets are included in this repository.*

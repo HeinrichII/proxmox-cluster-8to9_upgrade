@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
 # ============================================================
-# pve9-preflight.sh  —  PVE 8 -> 9 pre-flight & backup
+# pve9-preflight.sh  —  PVE 8 -> 9 pre-flight and backup gate
 # Run as root on EACH node BEFORE you upgrade that node.
-# Non-destructive: it only READS system state and WRITES backups.
+# Non-destructive: it only reads system state and writes backups.
 # It changes NO system configuration. Safe to run over SSH.
 # ============================================================
 set -uo pipefail
 
-BACKUP_DIR="${BACKUP_DIR:-/root/pve9-backup-$(hostname)-$(date +%Y%m%d-%H%M%S)}"
+CONFIG_BACKUP_DIR="${CONFIG_BACKUP_DIR:-/root/pve9-config-backup-$(hostname)-$(date +%Y%m%d-%H%M%S)}"
+GUEST_BACKUP_DIR="${GUEST_BACKUP_DIR:-}"
+BACKUP_RESTORE_TESTED="${BACKUP_RESTORE_TESTED:-NO}"
+BACKUP_MODE="${BACKUP_MODE:-snapshot}"
+HA_MAINTENANCE_CONFIRMED="${HA_MAINTENANCE_CONFIRMED:-NO}"
 MIN_FREE_GB=5
 REC_FREE_GB=10
 
@@ -17,6 +21,14 @@ ylw(){ printf '\033[33m%s\033[0m\n' "$*"; }
 hdr(){ printf '\n=== %s ===\n' "$*"; }
 
 [ "$(id -u)" -eq 0 ] || { red "Run as root."; exit 1; }
+
+case "$BACKUP_MODE" in
+  snapshot|stop|suspend) ;;
+  *) red "BACKUP_MODE must be snapshot, stop, or suspend."; exit 1 ;;
+esac
+
+PVE_STATUS_FILE="$(mktemp /tmp/pve9-preflight-status.XXXXXX)"
+trap 'rm -f "$PVE_STATUS_FILE"' EXIT
 
 GO=1
 fail(){ red "FAIL: $*"; GO=0; }
@@ -58,26 +70,37 @@ else
   ok "no Ceph at all — local storage path applies"
 fi
 
+hdr "Co-installed Proxmox Backup Server"
+if dpkg-query -W -f='${db:Status-Status}\n' proxmox-backup-server 2>/dev/null \
+  | grep -qx installed; then
+  fail "Proxmox Backup Server is co-installed; complete the supported PBS 3-to-4 path first"
+else
+  ok "Proxmox Backup Server is not co-installed"
+fi
+
 hdr "Cluster status"
-if pvecm status >"/tmp/pvecm.$$" 2>&1; then
-  cat "/tmp/pvecm.$$"
-  if grep -qiE 'Quorate:[[:space:]]*Yes' "/tmp/pvecm.$$"; then
+if pvecm status >"$PVE_STATUS_FILE" 2>&1; then
+  cat "$PVE_STATUS_FILE"
+  if grep -qiE 'Quorate:[[:space:]]*Yes' "$PVE_STATUS_FILE"; then
     ok "cluster is quorate"
   else
-    warn "cluster not showing quorate — do NOT upgrade a node unless the other two stay quorate"
+    fail "cluster is not quorate — restore cluster health before upgrading"
   fi
 else
-  warn "pvecm status failed (single node, or cluster service down):"
-  cat "/tmp/pvecm.$$"
+  fail "pvecm status failed — this cluster procedure requires a healthy, quorate cluster"
+  cat "$PVE_STATUS_FILE"
 fi
-rm -f "/tmp/pvecm.$$"
 
 hdr "HA resources (only matters if guests are HA-managed)"
 if command -v ha-manager >/dev/null 2>&1; then
   HA_OUT="$(ha-manager status 2>/dev/null || true)"
   echo "${HA_OUT:-<none>}"
   if echo "$HA_OUT" | grep -qE 'service (vm|ct):'; then
-    warn "HA-managed guests exist -> enable node-maintenance on THIS node before upgrade, disable after (see runbook)"
+    if [ "$HA_MAINTENANCE_CONFIRMED" = "YES" ]; then
+      ok "operator confirmed node maintenance mode for HA-managed guests"
+    else
+      fail "HA-managed guests exist; enable node maintenance, then re-run with HA_MAINTENANCE_CONFIRMED=YES"
+    fi
   else
     ok "no HA-managed guests — the maintenance-mode step does NOT apply, skip it"
   fi
@@ -85,55 +108,82 @@ else
   ok "ha-manager not present"
 fi
 
-hdr "Subscription-nag APT hook"
+hdr "Local APT hooks"
 if [ -f /etc/apt/apt.conf.d/no-nag-script ]; then
-  warn "no-nag-script hook present — pve9-repo-swap.sh will move it aside before the upgrade (expected)"
+  warn "unsupported no-nag-script hook present — repo-swap will park it; review it manually after the upgrade"
 else
-  ok "no nag hook present"
+  ok "no known third-party APT hook present"
 fi
 
 hdr "Guests on this node"
-qm list  2>/dev/null || true
+mapfile -t VMIDS < <(qm list 2>/dev/null | awk 'NR>1{print $1}')
+mapfile -t CTIDS < <(pct list 2>/dev/null | awk 'NR>1{print $1}')
+qm list 2>/dev/null || true
 pct list 2>/dev/null || true
 
-hdr "Backup: config -> $BACKUP_DIR"
-mkdir -p "$BACKUP_DIR"
-tar czf "$BACKUP_DIR/etc-$(hostname).tar.gz" \
+hdr "Backup: configuration -> $CONFIG_BACKUP_DIR"
+if mkdir -p "$CONFIG_BACKUP_DIR" && tar czf "$CONFIG_BACKUP_DIR/etc-$(hostname).tar.gz" \
   /etc/pve /etc/network/interfaces /etc/hosts /etc/hostname \
   /etc/passwd /etc/resolv.conf /etc/apt 2>/dev/null && \
-  ok "config archived: $BACKUP_DIR/etc-$(hostname).tar.gz" || warn "config tar had non-fatal warnings"
-cp -a /etc/pve/qemu-server "$BACKUP_DIR/qemu-server" 2>/dev/null || true
-cp -a /etc/pve/lxc         "$BACKUP_DIR/lxc"         2>/dev/null || true
+  [ -s "$CONFIG_BACKUP_DIR/etc-$(hostname).tar.gz" ]; then
+  ok "configuration archived: $CONFIG_BACKUP_DIR/etc-$(hostname).tar.gz"
+else
+  fail "configuration backup failed or is empty"
+fi
+cp -a /etc/pve/qemu-server "$CONFIG_BACKUP_DIR/qemu-server" 2>/dev/null || true
+cp -a /etc/pve/lxc "$CONFIG_BACKUP_DIR/lxc" 2>/dev/null || true
 
 hdr "Backup: guest disks (vzdump)"
-echo "Target: $BACKUP_DIR  (LOCAL disk — copy this OFF the node when done!)"
-mapfile -t VMIDS < <(qm list  2>/dev/null | awk 'NR>1{print $1}')
-mapfile -t CTIDS < <(pct list 2>/dev/null | awk 'NR>1{print $1}')
 if [ "${#VMIDS[@]}" -eq 0 ] && [ "${#CTIDS[@]}" -eq 0 ]; then
   ok "no guests on this node — nothing to vzdump"
 else
-  for id in "${VMIDS[@]}" "${CTIDS[@]}"; do
-    [ -n "$id" ] || continue
-    echo ">> vzdump $id"
-    vzdump "$id" --dumpdir "$BACKUP_DIR" --mode snapshot --compress zstd \
-      || warn "vzdump $id had issues — for a guaranteed-consistent copy use: vzdump $id --dumpdir $BACKUP_DIR --mode stop"
-  done
-  ok "guest backups written to $BACKUP_DIR"
+  if [ -z "$GUEST_BACKUP_DIR" ]; then
+    fail "guests exist: set GUEST_BACKUP_DIR to mounted external storage, then re-run"
+  elif ! mkdir -p "$GUEST_BACKUP_DIR" || [ ! -w "$GUEST_BACKUP_DIR" ]; then
+    fail "guest backup destination is unavailable or not writable: $GUEST_BACKUP_DIR"
+  else
+    ROOT_SOURCE="$(findmnt -n -o SOURCE --target / 2>/dev/null || true)"
+    BACKUP_SOURCE="$(findmnt -n -o SOURCE --target "$GUEST_BACKUP_DIR" 2>/dev/null || true)"
+    if [ -z "$BACKUP_SOURCE" ] || [ "$BACKUP_SOURCE" = "$ROOT_SOURCE" ]; then
+      fail "GUEST_BACKUP_DIR must be mounted external storage, not the node root filesystem"
+    else
+      ok "external guest backup target: $GUEST_BACKUP_DIR ($BACKUP_SOURCE)"
+      BACKUPS_OK=1
+      for id in "${VMIDS[@]}" "${CTIDS[@]}"; do
+        [ -n "$id" ] || continue
+        echo ">> vzdump $id"
+        if ! vzdump "$id" --dumpdir "$GUEST_BACKUP_DIR" --mode "$BACKUP_MODE" --compress zstd; then
+          fail "vzdump $id failed; do not upgrade until a valid backup succeeds"
+          BACKUPS_OK=0
+        fi
+      done
+      [ "$BACKUPS_OK" -eq 1 ] && ok "all guest backups completed on external storage"
+    fi
+  fi
+
+  if [ "$BACKUP_RESTORE_TESTED" = "YES" ]; then
+    ok "operator confirmed a backup restore test"
+  else
+    fail "a tested restore is required; set BACKUP_RESTORE_TESTED=YES only after verifying one"
+  fi
 fi
 
 hdr "pve8to9 --full  (the authoritative checker)"
 if command -v pve8to9 >/dev/null 2>&1; then
-  pve8to9 --full | tee "$BACKUP_DIR/pve8to9.txt"
-  FAILS=$(grep -c 'FAIL:' "$BACKUP_DIR/pve8to9.txt" || true)
-  WARNS=$(grep -c 'WARN:' "$BACKUP_DIR/pve8to9.txt" || true)
+  if ! pve8to9 --full | tee "$CONFIG_BACKUP_DIR/pve8to9.txt"; then
+    fail "pve8to9 did not complete successfully"
+  fi
+  FAILS=$(grep -c 'FAIL:' "$CONFIG_BACKUP_DIR/pve8to9.txt" || true)
+  WARNS=$(grep -c 'WARN:' "$CONFIG_BACKUP_DIR/pve8to9.txt" || true)
   echo
-  echo "pve8to9 summary: ${FAILS} FAIL, ${WARNS} WARN  (log: $BACKUP_DIR/pve8to9.txt)"
+  echo "pve8to9 summary: ${FAILS} FAIL, ${WARNS} WARN  (log: $CONFIG_BACKUP_DIR/pve8to9.txt)"
+  [ -s "$CONFIG_BACKUP_DIR/pve8to9.txt" ] || fail "pve8to9 produced no report"
   [ "${FAILS:-0}" -eq 0 ] || fail "pve8to9 reported FAILs — resolve each, then re-run this script"
 else
   fail "pve8to9 not found — this node is not on latest 8.4 packages yet"
 fi
 
-hdr "REV-3 sweep: NIC-pinning readiness"
+hdr "REV-4 sweep: NIC-pinning readiness"
 PVEMANAGER="$(pveversion | grep -oP '(?<=pve-manager/)[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
 if ver_ge "${PVEMANAGER:-0}" "8.4.9"; then
   ok "pve-manager $PVEMANAGER >= 8.4.9 -> pve-network-interface-pinning IS available (pin BEFORE upgrade, see runbook Step B)"
@@ -142,22 +192,22 @@ else
 fi
 echo "Current interfaces:"; ip -br link 2>/dev/null | awk '{print "   "$1" "$2}'
 
-hdr "REV-3 sweep: third-party repos + keyrings (SHA-1/sqv exposure)"
-THIRD="$(find /etc/apt -name '*.list' -print0 2>/dev/null | xargs -0 --no-run-if-empty grep -hE '^[[:space:]]*deb' 2>/dev/null | grep -vE 'debian\.org|proxmox\.com' || true)"
+hdr "REV-4 sweep: third-party repositories"
+ACTIVE_SOURCES="$(find /etc/apt \( -name '*.list' -o -name '*.sources' \) -print0 2>/dev/null \
+  | xargs -0 --no-run-if-empty grep -hE '^[[:space:]]*(deb(-src)?[[:space:]]|URIs:)' 2>/dev/null || true)"
+THIRD="$(printf '%s\n' "$ACTIVE_SOURCES" | grep -vE 'debian\.org|proxmox\.com|download\.docker\.com' || true)"
+DOCKER_SOURCE="$(printf '%s\n' "$ACTIVE_SOURCES" | grep 'download\.docker\.com' || true)"
 if [ -n "$THIRD" ]; then
-  warn "third-party repo(s) present — their keys may be SHA-1 (rejected by Trixie sqv). Refresh key at re-enable, not mid-upgrade:"
-  echo "$THIRD" | sed 's/^/   /'
+  fail "unsupported third-party repositories are enabled; disable and verify compatibility before the upgrade:"
+  printf '%s\n' "$THIRD" | sed 's/^/   /'
 else
-  ok "no third-party repos beyond Debian/Proxmox"
+  ok "no unknown third-party repositories enabled"
 fi
-echo "keyrings on disk:"; ls -1 /usr/share/keyrings/ 2>/dev/null | sed 's/^/   /'
-if ls /usr/share/keyrings/docker* >/dev/null 2>&1; then
-  ok "docker keyring present in /usr/share/keyrings"
-elif echo "$THIRD" | grep -q docker; then
-  warn "docker repo enabled but NO docker keyring in /usr/share/keyrings -> legacy key = likely SHA-1. Refresh at Step G (Node 2)."
+if [ -n "$DOCKER_SOURCE" ]; then
+  warn "Docker repository is enabled; repo-swap will disable it and Step G recreates it from Docker's current instructions"
 fi
 
-hdr "REV-3 sweep: boot method (do NOT blind-purge systemd-boot)"
+hdr "REV-4 sweep: boot method (do NOT blind-purge systemd-boot)"
 if command -v efibootmgr >/dev/null 2>&1 && efibootmgr >/dev/null 2>&1; then
   efibootmgr -v 2>/dev/null | grep -iE 'BootCurrent|Boot0|shim|grub' | head -6 | sed 's/^/   /'
   warn "UEFI system — if pve8to9 FAILs on systemd-boot, confirm GRUB/shim boots FIRST above before touching it"
@@ -165,7 +215,7 @@ else
   ok "legacy BIOS boot (no efibootmgr/EFI vars) — systemd-boot item does not apply"
 fi
 
-hdr "REV-3 sweep: sysctl + custom ACL roles"
+hdr "REV-4 sweep: sysctl + custom ACL roles"
 if [ -s /etc/sysctl.conf ] && grep -qvE '^[[:space:]]*(#|$)' /etc/sysctl.conf; then
   warn "/etc/sysctl.conf has custom tunables — migrate to /etc/sysctl.d/99-custom.conf after upgrade (precautionary):"
   grep -vE '^[[:space:]]*(#|$)' /etc/sysctl.conf | sed 's/^/   /'

@@ -1,12 +1,18 @@
-# Proxmox VE 8 → 9 Cluster Upgrade Runbook — REV 3
+# Proxmox VE 8 → 9 Cluster Upgrade — Validated Procedures (REV 4)
 
 **Deadline:** Aug 31, 2026 (PVE 8 EOL — confirmed against Proxmox's lifecycle table).
 **Your cluster:** 3× Dell Wyse 5060, currently **PVE 8.4.20**, 16 GB RAM / 1 TB each, no shared storage.
 **Target:** current Trixie repo = **PVE 9.2** — Debian 13.5, **kernel 7.0**, QEMU 11, LXC 7, ZFS 2.4.
 `apt` installs whatever 9.x is current; you don't get to pin 9.0. **Reboot into the new kernel is mandatory** regardless of your prior kernel.
-**Goal:** seamless — quorum never drops, each guest only blinks offline (or zero downtime if you migrate).
+**Goal:** preserve cluster quorum and control-plane availability while measuring and
+managing workload downtime separately. With local storage, an offline guest migration
+or shutdown may take materially longer than a brief interruption.
 
-> **REV-3 note:** merges the Aug 22 sweep. New vs rev-2: NIC pinning *before* upgrade, the Trixie **SHA-1/sqv** third-party-key landmine (scoped to Node 2 Docker only, at re-enable), systemd-boot / sysctl / custom-ACL checks, and an explicit third-party `apt update` gate per node. Verified against the official 8→9 wiki + the 9.2 release notes.
+> **Validation status:** The operational sequence was completed successfully in August
+> 2026. REV 4 hardens the scripts after a retrospective review: quorum, backups,
+> repositories, `apt update`, services, and networking now enforce nonzero stop
+> conditions. These changes pass static and syntax checks but require canary testing
+> before reuse on another cluster.
 
 ---
 
@@ -15,7 +21,9 @@
 1. **No Ceph** — local storage only. Pre-flight hard-fails if it finds Ceph.
 2. **No Proxmox Backup Server** co-installed.
 3. **No-subscription repos** (homelab). Confirmed from your repo dump.
-4. **Legacy-BIOS + ext4/LVM boot** (typical for Wyse thin clients). If pve8to9 raises a systemd-boot or ZFS-boot item, see Gotchas — likely N/A but handle it, don't assume.
+4. **UEFI/GRUB + ext4/LVM boot**, as observed on these nodes. If `pve8to9`
+   raises a systemd-boot or ZFS-boot item, investigate the actual boot path rather
+   than applying a generic package-removal fix.
 
 **Confirmed free passes for this cluster:** Ceph→Squid N/A (no Ceph) · PBS→4 N/A (not co-installed) · LVM autoactivation mostly N/A (no shared pool; local vols keep old behavior).
 
@@ -37,12 +45,18 @@
 | 2nd | **Node 2 (pve2)** | Docker | After canary passes. Only node with the SHA-1/Docker step. |
 | 3rd | **Node 3 (pve3)** | Nextcloud | Last. Cleanest repo set. |
 
-**Post-install tweaks (all nodes):** a Proxmox post-install/nag script customized these boxes.
-- **`no-nag-script` APT hook** → `pve9-repo-swap.sh` moves it aside pre-upgrade so it can't fire during `dist-upgrade`. Re-apply the nag fix after (Step G).
+**Local customizations:** a community customization installed `no-nag-script` as an
+APT hook. `pve9-repo-swap.sh` parks it before `dist-upgrade`; restoring unsupported
+UI modifications is outside this validated procedure.
+
+- **`no-nag-script` APT hook** → parked so non-vendor code cannot run while packages
+  are being configured.
 - **HA services enabled** = cluster default. Pre-flight runs `ha-manager status`; **no** `service vm:`/`ct:` lines = no HA-managed guests, skip maintenance mode. If any are listed: `ha-manager crm-command node-maintenance enable <node>` before, `... disable <node>` after. (9.2 also has cluster-wide HA arm/disarm if you ever need it.)
 - **`.save` / `.dpkg-old` repo leftovers** → ignored by apt (reads only `*.list` / `*.sources`). Leave them or `rm /etc/apt/sources.list.d/*.save /etc/apt/sources.list.d/*.dpkg-old`.
 
-**SHA-1 / sqv (Node 2 only):** Trixie's apt uses `sqv` and rejects SHA-1-signed keys since 2026-02-01. Your Debian + Proxmox keyrings are modern (confirmed present), so **the core upgrade is unaffected**. The only exposure is **Node 2's Docker key** (it's in the legacy trusted store, no `docker-archive-keyring.gpg`). Since repo-swap disables Docker for the upgrade, this can't bite mid-upgrade — it's handled at Docker re-enable (Step G, Node 2).
+**Third-party repositories:** Debian and Proxmox sources are allowlisted. Docker is
+disabled during the distribution upgrade and recreated afterward from Docker's current
+Debian instructions. Any other enabled vendor repository is a hard stop.
 
 ---
 
@@ -58,7 +72,11 @@ apt update && apt dist-upgrade
 apt install -y tmux
 # reboot if the kernel updated
 ```
-**Console access on standby** — real IPMI/physical/tmux console, **not** the web noVNC console (it dies with services mid-upgrade). NIC pinning below removes most of this risk, but keep it handy.
+The official guidance prefers a host-independent console such as IPMI or physical
+access. This lab had SSH only, so it consciously accepted that additional risk and used
+an identical empty node as the hardware canary. `tmux` protects the package process
+from an SSH disconnect, but it is **not** a console and cannot recover a boot or network
+failure. Do not copy this exception without a realistic recovery plan.
 
 ---
 
@@ -66,21 +84,36 @@ apt install -y tmux
 
 > Do it **inside tmux**: `tmux new -s pve9`  (re-attach: `tmux attach -t pve9`)
 
-### Step A — Pre-flight + backup *(read-only + backups; changes no config)*
+### Step A — Preflight + backup gate *(reads state and writes backups; changes no config)*
+
+When guests exist, mount external backup storage and verify a restore before setting
+the confirmation variable:
+
 ```
-/root/pve9-preflight.sh
+GUEST_BACKUP_DIR=/mnt/external-pve-backups \
+BACKUP_RESTORE_TESTED=YES \
+  /root/pve9-preflight.sh
 ```
-Wait for **`GO`**. It also runs the REV-3 sweep checks (third-party repos + keyrings, boot method via `efibootmgr`, `/etc/sysctl.conf` tunables, custom `VM.Monitor` ACL roles, NIC-pin readiness). Resolve FAILs, review WARNs. Copy the backup dir it names **off the node**.
+
+On an empty node, `GUEST_BACKUP_DIR` and `BACKUP_RESTORE_TESTED` are not required.
+Configuration archives remain local for convenience; guest backups must resolve to a
+different mounted filesystem. Wait for **`GO`**, resolve every failure, and review all
+warnings before continuing.
 
 ### Step B — Pin NIC names *(do this BEFORE the upgrade, on PVE 8)*
 Kernel 7.0 can rename interfaces; a stale `vmbr0` = no network on boot. Lock names now (tool is present on 8.4.20):
 ```
 pve-network-interface-pinning generate      # run --help first if unsure of subcommand
 ```
-Then **reboot on PVE 8** and confirm the node comes back with the pinned `nicX` names and full network (`ip -br link`, `ping` the gateway). This *decouples* the NIC risk from the upgrade — do it on **Node 1 first** so any surprise is on the empty box.
+Inspect every generated `.new` configuration against its active file, including the
+bridge port expected by `vmbr0`. Apply only the reviewed changes. Then **reboot on PVE
+8** and confirm that the node returns with the pinned `nicX` names and full network
+(`ip -br link`, `ping` the gateway). This decouples NIC risk from upgrade risk.
 
 ### Step C — Guests off this node *(skip on empty Node 1)*
-No shared storage, so either **migrate** for zero downtime or **stop** (simpler; fine given light use):
+There is no shared storage. The examples below use offline migration or shutdown and
+therefore incur workload downtime; record the actual duration rather than calling it
+zero downtime:
 ```
 qm migrate  <vmid> <other-node> --online 0     # or: qm stop  <vmid>
 pct migrate <ctid> <other-node>                # or: pct stop <ctid>
@@ -91,7 +124,9 @@ pct migrate <ctid> <other-node>                # or: pct stop <ctid>
 ```
 /root/pve9-repo-swap.sh
 ```
-Type `YES`. Confirm `apt update` was **error-free** and `apt policy` shows **only** Debian trixie + pve-no-subscription trixie.
+Type `YES`. The script refuses unknown third-party sources, refuses enabled Bookworm
+entries, and exits nonzero unless `apt update` succeeds. Review `apt policy` before
+continuing.
 
 ### Step E — The upgrade *(interactive — you drive)*
 ```
@@ -103,7 +138,7 @@ Answers for a stock setup:
 |---|---|
 | `/etc/issue` | **No** (keep) |
 | `/etc/lvm/lvm.conf` | **Yes** (maintainer's) if never hand-edited |
-| `/etc/ssh/sshd_config` | **Yes** (maintainer's) |
+| `/etc/ssh/sshd_config` | **Inspect the diff.** Use the maintainer version only when the differences are the expected deprecated-option/comment changes and remote access remains valid. |
 | `/etc/default/grub` | **No** (keep) unless you edited it |
 | `/etc/chrony/chrony.conf` | **Yes** (maintainer's) if never hand-edited |
 | "Restart services without asking?" | default is fine |
@@ -116,28 +151,38 @@ Don't interrupt it — on the 5060's storage the dist-upgrade can run toward an 
 reboot
 /root/pve9-postcheck.sh
 ```
-Green = `pveversion` 9.x, kernel 7.0, **Quorate: Yes**, no failed units, guests back, NIC names intact, and an explicit third-party `apt update` that's clean (so a SHA-1 rejection surfaces here, not on the next node). Hard-refresh the UI (**Ctrl+Shift+R**).
+Exit status 0 and `PASS` require PVE 9, **Quorate: Yes**, active core services,
+no failed units, working networking, and a successful `apt update`. Application-level
+guest health still requires human verification. Hard-refresh the UI (**Ctrl+Shift+R**).
 
-### Step G — Restore tweaks *(after the node is verified 9.x)*
-Re-apply the nag fix (swap script prints this too):
+### Step G — Restore required services *(after the node is verified 9.x)*
+
+Do not restore the parked third-party APT hook as part of the upgrade procedure.
+
+**Node 2 only — recreate Docker's repository using the current vendor format:**
+
 ```
-cp /usr/share/javascript/proxmox-widget-toolkit/proxmoxlib.js{,.bak}
-sed -i "s/data.status.toLowerCase() !== 'active'/data.status.toLowerCase() === 'active'/" \
-    /usr/share/javascript/proxmox-widget-toolkit/proxmoxlib.js
-systemctl restart pveproxy      # then Ctrl+Shift+R
-```
-**Node 2 only — bring Docker back on trixie WITH a fresh (non-SHA-1) key:**
-```
-install -m0755 -d /usr/share/keyrings
+install -m 0755 -d /etc/apt/keyrings
 curl -fsSL https://download.docker.com/linux/debian/gpg \
-  | gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
-# comment every old docker line, then add ONE clean trixie line pinned to the fresh key:
-sed -i '/download.docker.com/ s/^deb/#deb/' /etc/apt/sources.list
-echo 'deb [arch=amd64 signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/debian trixie stable' >> /etc/apt/sources.list
+  -o /etc/apt/keyrings/docker.asc
+chmod a+r /etc/apt/keyrings/docker.asc
+
+cat > /etc/apt/sources.list.d/docker.sources <<'EOF'
+Types: deb
+URIs: https://download.docker.com/linux/debian
+Suites: trixie
+Components: stable
+Architectures: amd64
+Signed-By: /etc/apt/keyrings/docker.asc
+EOF
+
 apt update && apt install --only-upgrade docker-ce docker-ce-cli containerd.io
-docker ps      # confirm your container(s) came back
+systemctl start docker
+docker ps
 ```
-The fresh key is SHA-256-bound, so sqv accepts it. If Docker on Node 2 turns out to be Debian's `docker.io` (not `docker-ce`), tell me — different re-enable.
+
+This follows Docker's current Debian repository layout. If the node uses Debian's
+`docker.io` instead of Docker CE, do not add Docker's vendor repository.
 
 **Only when Node N is fully green do you start Step A on the next node.**
 
@@ -156,21 +201,38 @@ The fresh key is SHA-256-bound, so sqv accepts it. If Docker on Node 2 turns out
 
 **No in-place downgrade 9→8** — the canary + backups are the safety net.
 
-- **Before dist-upgrade:** nothing irreversible. Restore `/root/apt-sources-backup-*` and you're still on 8.4.
+- **Before dist-upgrade:** restore the timestamped `/root/apt-sources-backup-*`
+  configuration and re-run `apt update`; the node is still on 8.4 packages.
 - **dist-upgrade fails partway:** `apt -f install`, then re-run `apt dist-upgrade`. If it wants to *remove* `proxmox-ve`, a repo line is still bookworm — fix it.
-- **Won't boot / no NIC:** fix at the console (Gotchas). Worst case: reinstall 9.2 on that one node and rejoin — the other two stayed up.
+- **Won't boot / no NIC:** SSH cannot recover this. Attach a physical console or boot
+  rescue media; if recovery requires travel or new hardware, that is real recovery
+  time. Worst case, reinstall that node, rejoin it, and restore guests from external
+  backups while the other two nodes retain quorum.
 
 ---
 
 ## Gotchas specific to your setup
 
 - **NIC rename** — mitigated by Step B (pin on 8, reboot-verify). If a name still drifts: `ip -br link`, edit `/etc/network/interfaces`, `systemctl restart networking`.
-- **systemd-boot meta-package** *(highest severity — wrong move = won't boot)* — pve8to9 may FAIL on it. **Do NOT blind-purge.** Confirm how you actually boot first: `efibootmgr -v` (GRUB-via-shim first = you boot GRUB, the systemd-boot pkg is vestigial). On legacy-BIOS Wyse boxes this is likely a non-issue. If unsure, stop and send me `efibootmgr -v` output.
-- **SHA-1 / sqv** — only Node 2 Docker (handled in Step G). If any *other* enabled repo throws `sqv ... SHA1 is not considered secure`, refresh that vendor's key into `/usr/share/keyrings/` and add `signed-by=` — don't disable signature checking.
+- **systemd-boot meta-package** *(highest severity — wrong move = won't boot)* —
+  `pve8to9` may flag it. **Do not blind-purge.** Confirm the actual UEFI boot path with
+  `efibootmgr -v` and follow the checker/official upgrade guidance.
+- **Repository signature rejection** — Docker on Node 2 was the historical case and is
+  handled in Step G. If another vendor repository fails verification, disable it and
+  follow that vendor's current keyring instructions; never disable signature checking.
 - **Custom ACL roles** — if Step A found `VM.Monitor` in `/etc/pve/user.cfg`, migrate those roles to `Sys.Audit` / `VM.GuestAgent.*` (renamed in 9). Empty = skip.
 - **`/tmp` is tmpfs on Trixie** (≤50% RAM ≈ 8 GB here), auto-cleaned — don't park large files there.
 - **Old-AMD canary** — if Node 1 throws kernel/illegal-instruction errors on boot, **stop**, leave Nodes 2/3, and send me the console output.
 
 ---
 
-*Sources: Proxmox official "Upgrade from 8 to 9" wiki; PVE 9.2 release notes (Debian 13.5 / kernel 7.0, May 21 2026); Debian Trixie sqv SHA-1 policy (effective 2026-02-01); pve-network-interface-pinning backport to pve-manager ≥ 8.4.9. Verified Aug 22, 2026.*
+## Sources
+
+- [Proxmox VE: Upgrade from 8 to 9](https://pve.proxmox.com/wiki/Upgrade_from_8_to_9)
+- [Proxmox VE 9.2 release announcement](https://forum.proxmox.com/threads/proxmox-virtual-environment-9-2-available.183741/)
+- [Proxmox network-interface pinning](https://pve.proxmox.com/wiki/Network_Configuration#network_override_device_names)
+- [Docker Engine on Debian](https://docs.docker.com/engine/install/debian/)
+- [Debian 13 release notes](https://www.debian.org/releases/trixie/release-notes/)
+
+Source guidance last reviewed August 22, 2026; safety-gate revision completed
+September 4, 2026.

@@ -1,47 +1,126 @@
 #!/usr/bin/env bash
 # ============================================================
-# pve9-postcheck.sh  —  verify a node after dist-upgrade + reboot.
-# Run as root on the freshly-upgraded node.
+# pve9-postcheck.sh — hard-gate a node after upgrade and reboot.
+# Run as root on the freshly upgraded node. A nonzero exit means
+# the next cluster node must not be upgraded yet.
 # ============================================================
 set -uo pipefail
+
+red(){ printf '\033[31m%s\033[0m\n' "$*"; }
 grn(){ printf '\033[32m%s\033[0m\n' "$*"; }
 ylw(){ printf '\033[33m%s\033[0m\n' "$*"; }
 hdr(){ printf '\n=== %s ===\n' "$*"; }
 
-hdr "Version (expect 9.x) + kernel"
-pveversion
+[ "$(id -u)" -eq 0 ] || { red "Run as root."; exit 1; }
+
+PASS=1
+fail(){ red "FAIL: $*"; PASS=0; }
+warn(){ ylw "WARN: $*"; }
+ok(){ grn "OK:   $*"; }
+
+STATUS_FILE="$(mktemp /tmp/pve9-postcheck-status.XXXXXX)"
+APT_LOG="$(mktemp /tmp/pve9-postcheck-apt.XXXXXX)"
+UNITS_FILE="$(mktemp /tmp/pve9-postcheck-units.XXXXXX)"
+trap 'rm -f "$STATUS_FILE" "$APT_LOG" "$UNITS_FILE"' EXIT
+
+hdr "Version and kernel"
+PVE_OUTPUT="$(pveversion 2>&1 || true)"
+printf '%s\n' "$PVE_OUTPUT"
 uname -r
-
-hdr "Cluster status (expect Quorate: Yes)"
-pvecm status || ylw "pvecm status failed — investigate before touching the next node"
-
-hdr "Guests (should be running as before)"
-qm list  2>/dev/null || true
-pct list 2>/dev/null || true
-
-hdr "Failed systemd units (should be empty)"
-systemctl --failed --no-legend || true
-
-hdr "pve8to9 --full (post-upgrade pass — expect clean / info only)"
-pve8to9 --full 2>/dev/null || ylw "pve8to9 not present post-upgrade (expected on 9.x) — skip"
-
-hdr "Active repos"
-apt policy 2>/dev/null | grep -iE 'trixie|pve' || true
-
-hdr "Explicit apt update (catches SHA-1/sqv rejection on THIS node)"
-if apt update 2>&1 | tee /tmp/aptupd.$$ | grep -qiE 'sqv .*error|SHA1 is not considered secure|is not signed'; then
-  ylw "SHA-1 / signature rejection detected — refresh the offending vendor key into /usr/share/keyrings and add signed-by= (see runbook Step G / Gotchas):"
-  grep -iE 'sqv|SHA1|not signed|Err:' /tmp/aptupd.$$ | sed 's/^/   /'
+if printf '%s\n' "$PVE_OUTPUT" | grep -qE 'pve-manager/9\.'; then
+  ok "pve-manager major version is 9"
 else
-  grn "apt update clean — no signature rejections"
+  fail "pve-manager 9.x was not detected"
 fi
-rm -f /tmp/aptupd.$$
 
-hdr "Network / NIC names intact"
+hdr "Cluster status"
+if pvecm status >"$STATUS_FILE" 2>&1; then
+  cat "$STATUS_FILE"
+  if grep -qiE 'Quorate:[[:space:]]*Yes' "$STATUS_FILE"; then
+    ok "cluster is quorate"
+  else
+    fail "cluster is not quorate"
+  fi
+else
+  cat "$STATUS_FILE"
+  fail "pvecm status failed"
+fi
+
+hdr "Core Proxmox services"
+for service in pve-cluster pvedaemon pveproxy pvestatd corosync; do
+  if systemctl is-active --quiet "$service"; then
+    ok "$service is active"
+  else
+    fail "$service is not active"
+  fi
+done
+
+hdr "Guests (compare expected state before continuing)"
+qm list 2>/dev/null || fail "qm list failed"
+pct list 2>/dev/null || fail "pct list failed"
+
+hdr "Failed systemd units"
+systemctl --failed --no-legend >"$UNITS_FILE" 2>&1 || true
+if [ -s "$UNITS_FILE" ]; then
+  cat "$UNITS_FILE"
+  fail "one or more systemd units failed"
+else
+  ok "no failed systemd units"
+fi
+
+hdr "pve8to9 checker"
+if command -v pve8to9 >/dev/null 2>&1; then
+  CHECK_STATUS=0
+  CHECK_OUTPUT="$(pve8to9 --full 2>&1)" || CHECK_STATUS=$?
+  printf '%s\n' "$CHECK_OUTPUT"
+  if [ "$CHECK_STATUS" -ne 0 ]; then
+    fail "pve8to9 returned status $CHECK_STATUS"
+  elif [ -z "$CHECK_OUTPUT" ]; then
+    fail "pve8to9 produced no report"
+  elif printf '%s\n' "$CHECK_OUTPUT" | grep -q 'FAIL:'; then
+    fail "pve8to9 still reports failures"
+  else
+    ok "pve8to9 reports no failures"
+  fi
+else
+  warn "pve8to9 is not present after the upgrade; skipped"
+fi
+
+hdr "Active repositories"
+apt policy 2>/dev/null | grep -iE 'trixie|pve' || true
+ACTIVE_BOOKWORM="$(find /etc/apt \( -name '*.list' -o -name '*.sources' \) -print0 2>/dev/null \
+  | xargs -0 --no-run-if-empty grep -HE '^[[:space:]]*(deb(-src)?[[:space:]]|Suites:).*bookworm' 2>/dev/null || true)"
+if [ -n "$ACTIVE_BOOKWORM" ]; then
+  printf '%s\n' "$ACTIVE_BOOKWORM"
+  fail "enabled Bookworm repository entries remain"
+else
+  ok "no enabled Bookworm repository entry detected"
+fi
+
+hdr "apt update"
+if apt update 2>&1 | tee "$APT_LOG"; then
+  if grep -qiE 'sqv .*error|SHA1 is not considered secure|is not signed|^Err:' "$APT_LOG"; then
+    fail "apt reported a signature or repository error"
+  else
+    ok "apt update completed without detected repository errors"
+  fi
+else
+  fail "apt update returned a nonzero status"
+fi
+
+hdr "Network"
 ip -br link 2>/dev/null | awk '{print "   "$1" "$2}'
-ip -br addr show up 2>/dev/null | grep -qE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' \
-  && grn "node has an IP / network is up" || ylw "no IPv4 up — check /etc/network/interfaces vs current NIC names"
+if ip -br addr show up 2>/dev/null | grep -qE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+'; then
+  ok "node has an active IPv4 address"
+else
+  fail "no active IPv4 address detected"
+fi
 
-echo
-grn "If: pveversion = 9.x, cluster Quorate: Yes, no failed units, guests running —"
-grn "this node is DONE. Move to the NEXT node. Never upgrade two nodes at once."
+hdr "VERDICT for $(hostname)"
+if [ "$PASS" -eq 1 ]; then
+  grn "PASS — this node passed automated checks. Confirm guest application health before proceeding."
+  exit 0
+fi
+
+red "NO-GO — resolve every FAIL before upgrading the next node."
+exit 2
